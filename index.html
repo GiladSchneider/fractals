@@ -145,8 +145,6 @@
 <body>
 
 <div id="controls">
-  <h1>Fractal Explorer</h1>
-
   <div>
     <label>Fractal Type</label>
     <select id="fractalType">
@@ -243,7 +241,7 @@ void main() {
   }
 
   int iter = 0;
-  for (int i = 0; i < 2000; i++) {
+  for (int i = 0; i < 1000; i++) {
     if (i >= u_maxIter) break;
     x2 = x * x;
     y2 = y * y;
@@ -312,7 +310,7 @@ function renderGL() {
   gl.uniform2f(uResolution, glCanvas.width, glCanvas.height);
   gl.uniform2f(uCenter, view.cx, view.cy);
   gl.uniform1f(uScale, view.scale);
-  gl.uniform1i(uMaxIter, 2000);
+  gl.uniform1i(uMaxIter, 1000);
   gl.uniform1i(uType, typeMap[fractalSelect.value]);
   gl.uniform2f(uJuliaC, parseFloat(juliaCR.value), parseFloat(juliaCI.value));
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -341,8 +339,11 @@ function resetView() {
 function resize() {
   width = window.innerWidth;
   height = window.innerHeight;
-  glCanvas.width = width;
-  glCanvas.height = height;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  glCanvas.width = width * dpr;
+  glCanvas.height = height * dpr;
+  glCanvas.style.width = width + 'px';
+  glCanvas.style.height = height + 'px';
   scheduleRender();
 }
 
