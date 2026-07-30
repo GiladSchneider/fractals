@@ -365,7 +365,12 @@ function screenToFractal(sx, sy) {
 // ===================== Mouse interaction =====================
 glCanvas.addEventListener('wheel', (e) => {
   e.preventDefault();
-  const zoom = e.deltaY > 0 ? 1.04 : 0.962;
+  // Normalize delta across browsers (Chrome/Brave use deltaMode 0 with large values,
+  // Safari uses deltaMode 0 with small values)
+  let delta = e.deltaY;
+  if (e.deltaMode === 1) delta *= 40;
+  if (e.deltaMode === 2) delta *= 800;
+  const zoom = Math.pow(1.02, delta);
   const aspect = width / height;
   const pt = screenToFractal(e.clientX, e.clientY);
   view.scale *= zoom;
