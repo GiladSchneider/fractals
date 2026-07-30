@@ -241,7 +241,7 @@ void main() {
   }
 
   int iter = 0;
-  for (int i = 0; i < 1000; i++) {
+  for (int i = 0; i < 1500; i++) {
     if (i >= u_maxIter) break;
     x2 = x * x;
     y2 = y * y;
@@ -310,7 +310,7 @@ function renderGL() {
   gl.uniform2f(uResolution, glCanvas.width, glCanvas.height);
   gl.uniform2f(uCenter, view.cx, view.cy);
   gl.uniform1f(uScale, view.scale);
-  gl.uniform1i(uMaxIter, 1000);
+  gl.uniform1i(uMaxIter, 1500);
   gl.uniform1i(uType, typeMap[fractalSelect.value]);
   gl.uniform2f(uJuliaC, parseFloat(juliaCR.value), parseFloat(juliaCI.value));
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
