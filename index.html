@@ -537,55 +537,21 @@ function needsDF64() {
 }
 
 // Scale iterations with zoom depth — no point running 2000 iterations at 1x zoom
-function computeMaxIter(interacting) {
+function computeMaxIter() {
   const d = defaults[fractalSelect.value];
   const zoomFactor = d.scale / view.scale;
-  let maxIter = Math.max(200, Math.min(2000,
+  return Math.max(200, Math.min(2000,
     Math.floor(200 + 50 * Math.log2(Math.max(1, zoomFactor)))
   ));
-  // Cap iterations during interaction for snappy response
-  if (interacting) maxIter = Math.min(maxIter, 500);
-  return maxIter;
-}
-
-// ===================== Interaction resolution scaling =====================
-// Render at half pixel density during zoom/pan for responsiveness.
-// When interaction stops, re-render at full quality.
-let idleTimer = null;
-
-function setCanvasPixels(factor) {
-  const w = Math.round(width * dpr * factor);
-  const h = Math.round(height * dpr * factor);
-  if (glCanvas.width !== w || glCanvas.height !== h) {
-    glCanvas.width = w;
-    glCanvas.height = h;
-  }
-}
-
-function scheduleIdleRender() {
-  clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => {
-    idleTimer = null;
-    setCanvasPixels(1.0);
-    scheduleRender();
-  }, 150);
-}
-
-// Called by all interaction handlers instead of scheduleRender()
-function interactionRender() {
-  setCanvasPixels(0.5);
-  scheduleIdleRender();
-  scheduleRender();
 }
 
 // ===================== Render =====================
 
 function renderGL() {
-  const interacting = idleTimer !== null;
   const fractalType = typeMap[fractalSelect.value];
   const juliaR = parseFloat(juliaCR.value);
   const juliaI = parseFloat(juliaCI.value);
-  const maxIter = computeMaxIter(interacting);
+  const maxIter = computeMaxIter();
 
   gl.viewport(0, 0, glCanvas.width, glCanvas.height);
 
@@ -634,9 +600,6 @@ function scheduleRender() {
 function resetView() {
   const d = defaults[fractalSelect.value];
   view = { cx: d.cx, cy: d.cy, scale: d.scale };
-  clearTimeout(idleTimer);
-  idleTimer = null;
-  setCanvasPixels(1.0);
   scheduleRender();
 }
 
@@ -646,7 +609,8 @@ function resize() {
   dpr = Math.min(window.devicePixelRatio || 1, 2);
   glCanvas.style.width = width + 'px';
   glCanvas.style.height = height + 'px';
-  setCanvasPixels(idleTimer !== null ? 0.5 : 1.0);
+  glCanvas.width = Math.round(width * dpr);
+  glCanvas.height = Math.round(height * dpr);
   scheduleRender();
 }
 
@@ -671,7 +635,7 @@ glCanvas.addEventListener('wheel', (e) => {
   view.scale *= zoom;
   view.cx = pt.r - (e.clientX / width - 0.5) * view.scale * aspect;
   view.cy = pt.i - (e.clientY / height - 0.5) * view.scale;
-  interactionRender();
+  scheduleRender();
 }, { passive: false });
 
 glCanvas.addEventListener('mousedown', (e) => {
@@ -686,7 +650,7 @@ glCanvas.addEventListener('mousemove', (e) => {
   const aspect = width / height;
   view.cx = viewStart.cx - ((e.clientX - dragStart.x) / width) * view.scale * aspect;
   view.cy = viewStart.cy - ((e.clientY - dragStart.y) / height) * view.scale;
-  interactionRender();
+  scheduleRender();
 });
 
 glCanvas.addEventListener('mouseup', () => { isDragging = false; glCanvas.style.cursor = 'crosshair'; });
@@ -718,7 +682,7 @@ glCanvas.addEventListener('touchmove', (e) => {
     const aspect = width / height;
     view.cx = viewStart.cx - ((e.touches[0].clientX - dragStart.x) / width) * view.scale * aspect;
     view.cy = viewStart.cy - ((e.touches[0].clientY - dragStart.y) / height) * view.scale;
-    interactionRender();
+    scheduleRender();
   } else if (e.touches.length === 2) {
     const t0 = e.touches[0], t1 = e.touches[1];
     const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
@@ -733,7 +697,7 @@ glCanvas.addEventListener('touchmove', (e) => {
     view.scale = newScale;
     view.cx = pt.r - (cx / width - 0.5) * newScale * aspect;
     view.cy = pt.i - (cy / height - 0.5) * newScale;
-    interactionRender();
+    scheduleRender();
   }
 }, { passive: false });
 
@@ -752,8 +716,8 @@ fractalSelect.addEventListener('change', () => {
   resetView();
 });
 
-juliaCR.addEventListener('input', () => { juliaCRVal.textContent = juliaCR.value; interactionRender(); });
-juliaCI.addEventListener('input', () => { juliaCIVal.textContent = juliaCI.value; interactionRender(); });
+juliaCR.addEventListener('input', () => { juliaCRVal.textContent = juliaCR.value; scheduleRender(); });
+juliaCI.addEventListener('input', () => { juliaCIVal.textContent = juliaCI.value; scheduleRender(); });
 resetBtn.addEventListener('click', resetView);
 window.addEventListener('resize', resize);
 
