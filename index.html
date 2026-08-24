@@ -171,7 +171,7 @@
 <script>
 // ===================== WebGL setup =====================
 const glCanvas = document.getElementById('glCanvas');
-const gl = glCanvas.getContext('webgl', { antialias: false, preserveDrawingBuffer: false });
+const gl = glCanvas.getContext('webgl', { antialias: false, preserveDrawingBuffer: true });
 
 let width, height, dpr;
 let view = {};
@@ -201,8 +201,7 @@ attribute vec2 a_pos;
 void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }
 `;
 
-// --- Fast single-precision shader (shallow zoom, 60fps) ---
-// Optimizations: cardioid/bulb skip, periodicity checking
+// --- Shader 1: Fast single-precision (shallow zoom, all types) ---
 const fragSrcFast = `
 precision highp float;
 uniform vec2 u_resolution;
@@ -213,11 +212,7 @@ uniform int u_type;
 uniform vec2 u_juliaC;
 
 vec3 copper(float t) {
-  return vec3(
-    min(1.0, t * 1.8),
-    min(1.0, t * 1.1 * 0.706),
-    min(1.0, t * 0.6 * 0.471)
-  );
+  return vec3(min(1.0, t*1.8), min(1.0, t*1.1*0.706), min(1.0, t*0.6*0.471));
 }
 
 void main() {
@@ -225,82 +220,96 @@ void main() {
   vec2 uv = gl_FragCoord.xy / u_resolution;
   float cr = u_center.x + (uv.x - 0.5) * u_scale * aspect;
   float ci = u_center.y + (0.5 - uv.y) * u_scale;
+  float x, y, x2, y2, px, py;
+  if (u_type == 1) { x = cr; y = ci; px = u_juliaC.x; py = u_juliaC.y; }
+  else { x = 0.0; y = 0.0; px = cr; py = ci; }
 
-  float x, y, x2, y2;
-  float px, py;
-
-  if (u_type == 1) {
-    x = cr; y = ci;
-    px = u_juliaC.x; py = u_juliaC.y;
-  } else {
-    x = 0.0; y = 0.0;
-    px = cr; py = ci;
-  }
-
-  // Cardioid and period-2 bulb check — skip iteration for known-interior points
   if (u_type == 0) {
-    float xm = px - 0.25;
-    float py2 = py * py;
-    float q = xm * xm + py2;
-    if (q * (q + xm) < 0.25 * py2) {
-      gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
-      return;
-    }
-    if ((px + 1.0) * (px + 1.0) + py2 < 0.0625) {
-      gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
-      return;
-    }
+    float xm = px - 0.25, py2 = py*py, q = xm*xm + py2;
+    if (q*(q+xm) < 0.25*py2) { gl_FragColor = vec4(0,0,0,1); return; }
+    if ((px+1.0)*(px+1.0)+py2 < 0.0625) { gl_FragColor = vec4(0,0,0,1); return; }
   }
 
   int iter = 0;
-  float check_r = 0.0, check_i = 0.0;
-  int check_count = 0;
-
+  float ck_r = 0.0, ck_i = 0.0; int ck_c = 0;
   for (int i = 0; i < 2000; i++) {
     if (i >= u_maxIter) break;
-    x2 = x * x;
-    y2 = y * y;
-    if (x2 + y2 > 4.0) break;
-
+    x2 = x*x; y2 = y*y;
+    if (x2+y2 > 4.0) break;
     float ny;
-    if (u_type == 2) {
-      ny = abs(2.0 * x * y) + py;
-    } else if (u_type == 3) {
-      ny = -2.0 * x * y + py;
-    } else {
-      ny = 2.0 * x * y + py;
-    }
-    x = x2 - y2 + px;
-    y = ny;
-    iter++;
-
-    // Periodicity check — detect cyclic orbits and bail out early
-    float dr = x - check_r;
-    float di = y - check_i;
-    if (dr * dr + di * di < 1.0e-12) {
-      iter = u_maxIter;
-      break;
-    }
-    check_count++;
-    if (check_count > 20) {
-      check_count = 0;
-      check_r = x;
-      check_i = y;
-    }
+    if (u_type==2) ny = abs(2.0*x*y)+py;
+    else if (u_type==3) ny = -2.0*x*y+py;
+    else ny = 2.0*x*y+py;
+    x = x2-y2+px; y = ny; iter++;
+    float dr=x-ck_r, di=y-ck_i;
+    if (dr*dr+di*di < 1.0e-12) { iter=u_maxIter; break; }
+    ck_c++; if (ck_c>20) { ck_c=0; ck_r=x; ck_i=y; }
   }
-
-  if (iter >= u_maxIter) {
-    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
-  } else {
-    float fIter = float(iter) + 1.0 - log(log(sqrt(x*x + y*y))) / log(2.0);
-    float t = fIter / float(u_maxIter);
-    gl_FragColor = vec4(copper(t), 1.0);
+  if (iter >= u_maxIter) { gl_FragColor = vec4(0,0,0,1); }
+  else {
+    float f = float(iter)+1.0-log(log(sqrt(x*x+y*y)))/log(2.0);
+    gl_FragColor = vec4(copper(f/float(u_maxIter)), 1.0);
   }
 }
 `;
 
-// --- df64 emulated double-precision shader (deep zoom) ---
-// Optimizations: 2-multiply iteration, cardioid/bulb skip, periodicity checking
+// --- Shader 2: Perturbation theory (deep zoom, Mandelbrot & Julia) ---
+// ONE reference orbit precomputed on CPU in float64, uploaded as texture.
+// Each pixel only computes its tiny delta from the reference in cheap float32.
+// Same speed as the fast shader — no df64 overhead.
+const fragSrcPerturb = `
+precision highp float;
+uniform vec2 u_resolution;
+uniform float u_pixelScale;
+uniform int u_maxIter;
+uniform int u_type;
+uniform sampler2D u_refOrbit;
+uniform float u_orbitLen;
+uniform vec2 u_refOffset;
+
+vec3 copper(float t) {
+  return vec3(min(1.0, t*1.8), min(1.0, t*1.1*0.706), min(1.0, t*0.6*0.471));
+}
+
+void main() {
+  float dcr = u_refOffset.x + (gl_FragCoord.x - u_resolution.x * 0.5) * u_pixelScale;
+  float dci = u_refOffset.y + (u_resolution.y * 0.5 - gl_FragCoord.y) * u_pixelScale;
+
+  float dr, di;
+  if (u_type == 1) { dr = dcr; di = dci; }  // Julia: delta starts at pixel offset
+  else { dr = 0.0; di = 0.0; }               // Mandelbrot: delta starts at 0
+
+  float Zr = 0.0, Zi = 0.0;
+  int iter = 0;
+
+  for (int i = 0; i < 2000; i++) {
+    if (i >= u_maxIter) break;
+    if (float(i) >= u_orbitLen) { iter = u_maxIter; break; }
+
+    vec2 Zn = texture2D(u_refOrbit, vec2((float(i)+0.5)/u_orbitLen, 0.5)).xy;
+    Zr = Zn.x; Zi = Zn.y;
+
+    float zr = Zr + dr, zi = Zi + di;
+    if (zr*zr + zi*zi > 4.0) break;
+
+    // delta_{n+1} = 2*Z_n*delta_n + delta_n^2 [+ delta_c for Mandelbrot]
+    float ndr = 2.0*(Zr*dr - Zi*di) + dr*dr - di*di;
+    float ndi = 2.0*(Zr*di + Zi*dr) + 2.0*dr*di;
+    if (u_type == 0) { ndr += dcr; ndi += dci; }
+    dr = ndr; di = ndi;
+    iter++;
+  }
+
+  if (iter >= u_maxIter) { gl_FragColor = vec4(0,0,0,1); }
+  else {
+    float zr = Zr+dr, zi = Zi+di;
+    float f = float(iter)+1.0-log(log(sqrt(zr*zr+zi*zi)))/log(2.0);
+    gl_FragColor = vec4(copper(f/float(u_maxIter)), 1.0);
+  }
+}
+`;
+
+// --- Shader 3: df64 emulated double (deep zoom fallback for Burning Ship, Tricorn) ---
 const fragSrcDF64 = `
 precision highp float;
 uniform vec2 u_resolution;
@@ -310,208 +319,117 @@ uniform int u_type;
 uniform vec2 u_juliaC;
 uniform float ONE;
 
-// ---- df64 primitives ----
-
 vec2 quickTwoSum(float a, float b) {
-  float s = a + b;
-  float e = b - (s * ONE - a) * ONE;
-  return vec2(s, e);
+  float s=a+b; return vec2(s, b-(s*ONE-a)*ONE);
 }
-
 vec2 twoSum(float a, float b) {
-  float s = a + b;
-  float v = (s * ONE - a) * ONE;
-  float e = (a - (s - v) * ONE) * ONE + (b - v);
-  return vec2(s, e);
+  float s=a+b, v=(s*ONE-a)*ONE;
+  return vec2(s, (a-(s-v)*ONE)*ONE+(b-v));
 }
-
 vec2 split_f(float a) {
-  const float SPLIT = 4097.0;
-  float t = a * SPLIT;
-  float hi = t * ONE - (t - a);
-  float lo = a * ONE - hi;
-  return vec2(hi, lo);
+  float t=a*4097.0, hi=t*ONE-(t-a);
+  return vec2(hi, a*ONE-hi);
 }
-
 vec2 twoProd(float a, float b) {
-  float p = a * b;
-  vec2 sa = split_f(a);
-  vec2 sb = split_f(b);
-  float err = ((sa.x * sb.x - p * ONE) + sa.x * sb.y + sa.y * sb.x) + sa.y * sb.y;
-  return vec2(p, err);
+  float p=a*b; vec2 sa=split_f(a), sb=split_f(b);
+  return vec2(p, ((sa.x*sb.x-p*ONE)+sa.x*sb.y+sa.y*sb.x)+sa.y*sb.y);
 }
-
 vec2 df_add(vec2 a, vec2 b) {
-  vec2 s = twoSum(a.x, b.x);
-  vec2 t = twoSum(a.y, b.y);
-  s.y += t.x;
-  s = quickTwoSum(s.x, s.y);
-  s.y += t.y;
-  s = quickTwoSum(s.x, s.y);
-  return s;
+  vec2 s=twoSum(a.x,b.x), t=twoSum(a.y,b.y);
+  s.y+=t.x; s=quickTwoSum(s.x,s.y); s.y+=t.y; return quickTwoSum(s.x,s.y);
 }
-
-vec2 df_sub(vec2 a, vec2 b) {
-  return df_add(a, vec2(-b.x, -b.y));
-}
-
+vec2 df_sub(vec2 a, vec2 b) { return df_add(a, vec2(-b.x,-b.y)); }
 vec2 df_mul(vec2 a, vec2 b) {
-  vec2 p = twoProd(a.x, b.x);
-  p.y += a.x * b.y;
-  p = quickTwoSum(p.x, p.y);
-  p.y += a.y * b.x;
-  p = quickTwoSum(p.x, p.y);
-  return p;
+  vec2 p=twoProd(a.x,b.x); p.y+=a.x*b.y;
+  p=quickTwoSum(p.x,p.y); p.y+=a.y*b.x; return quickTwoSum(p.x,p.y);
 }
-
 vec2 df_mul_f(vec2 a, float b) {
-  vec2 p = twoProd(a.x, b);
-  p.y += a.y * b;
-  p = quickTwoSum(p.x, p.y);
-  return p;
+  vec2 p=twoProd(a.x,b); p.y+=a.y*b; return quickTwoSum(p.x,p.y);
 }
 
 vec3 copper(float t) {
-  return vec3(
-    min(1.0, t * 1.8),
-    min(1.0, t * 1.1 * 0.706),
-    min(1.0, t * 0.6 * 0.471)
-  );
+  return vec3(min(1.0, t*1.8), min(1.0, t*1.1*0.706), min(1.0, t*0.6*0.471));
 }
 
 void main() {
-  float dx = gl_FragCoord.x - u_resolution.x * 0.5;
-  float dy = u_resolution.y * 0.5 - gl_FragCoord.y;
-  vec2 cr = df_add(u_cx, df_mul_f(u_pxScale, dx));
-  vec2 ci = df_add(u_cy, df_mul_f(u_pxScale, dy));
-
+  vec2 cr = df_add(u_cx, df_mul_f(u_pxScale, gl_FragCoord.x - u_resolution.x*0.5));
+  vec2 ci = df_add(u_cy, df_mul_f(u_pxScale, u_resolution.y*0.5 - gl_FragCoord.y));
   vec2 zr, zi, pr, pi;
+  if (u_type==1) { zr=cr; zi=ci; pr=vec2(u_juliaC.x,0.0); pi=vec2(u_juliaC.y,0.0); }
+  else { zr=vec2(0); zi=vec2(0); pr=cr; pi=ci; }
 
-  if (u_type == 1) {
-    zr = cr; zi = ci;
-    pr = vec2(u_juliaC.x, 0.0);
-    pi = vec2(u_juliaC.y, 0.0);
-  } else {
-    zr = vec2(0.0, 0.0); zi = vec2(0.0, 0.0);
-    pr = cr; pi = ci;
+  int iter=0; float ck_r=0.0, ck_i=0.0; int ck_c=0;
+  for (int i=0; i<2000; i++) {
+    if (i>=u_maxIter) break;
+    if (zr.x*zr.x+zi.x*zi.x > 4.0) break;
+    vec2 s=df_add(zr,zi), d=df_sub(zr,zi), zri=df_mul(zr,zi);
+    vec2 two_zri = df_add(zri,zri);
+    if (u_type==2) { if (two_zri.x<0.0||(two_zri.x==0.0&&two_zri.y<0.0)) two_zri=vec2(-two_zri.x,-two_zri.y); }
+    else if (u_type==3) { two_zri=vec2(-two_zri.x,-two_zri.y); }
+    zr=df_add(df_mul(s,d),pr); zi=df_add(two_zri,pi); iter++;
+    float drc=zr.x-ck_r, dic=zi.x-ck_i;
+    if (drc*drc+dic*dic<1.0e-12) { iter=u_maxIter; break; }
+    ck_c++; if (ck_c>20) { ck_c=0; ck_r=zr.x; ck_i=zi.x; }
   }
-
-  // Cardioid/bulb skip (Mandelbrot only, float32 hi parts suffice)
-  if (u_type == 0) {
-    float xm = pr.x - 0.25;
-    float py2 = pi.x * pi.x;
-    float q = xm * xm + py2;
-    if (q * (q + xm) < 0.25 * py2) {
-      gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
-      return;
-    }
-    if ((pr.x + 1.0) * (pr.x + 1.0) + py2 < 0.0625) {
-      gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
-      return;
-    }
-  }
-
-  int iter = 0;
-  float check_r = 0.0, check_i = 0.0;
-  int check_count = 0;
-
-  for (int i = 0; i < 2000; i++) {
-    if (i >= u_maxIter) break;
-
-    // Escape check — float32 hi parts are accurate enough for |z|>2
-    if (zr.x * zr.x + zi.x * zi.x > 4.0) break;
-
-    // 2-multiply optimization: (zr+zi)*(zr-zi) = zr²-zi² saves one df_mul
-    vec2 s = df_add(zr, zi);
-    vec2 d = df_sub(zr, zi);
-    vec2 zri = df_mul(zr, zi);
-    vec2 two_zri = df_add(zri, zri);
-
-    if (u_type == 2) { // Burning Ship: abs(2*zr*zi)
-      if (two_zri.x < 0.0 || (two_zri.x == 0.0 && two_zri.y < 0.0))
-        two_zri = vec2(-two_zri.x, -two_zri.y);
-    } else if (u_type == 3) { // Tricorn: -(2*zr*zi)
-      two_zri = vec2(-two_zri.x, -two_zri.y);
-    }
-
-    zr = df_add(df_mul(s, d), pr);  // zr²-zi² + pr
-    zi = df_add(two_zri, pi);       // 2*zr*zi + pi
-    iter++;
-
-    // Periodicity check — detect cyclic orbits using float32 hi parts
-    float drc = zr.x - check_r;
-    float dic = zi.x - check_i;
-    if (drc * drc + dic * dic < 1.0e-12) {
-      iter = u_maxIter;
-      break;
-    }
-    check_count++;
-    if (check_count > 20) {
-      check_count = 0;
-      check_r = zr.x;
-      check_i = zi.x;
-    }
-  }
-
-  if (iter >= u_maxIter) {
-    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
-  } else {
-    float fIter = float(iter) + 1.0 - log(log(sqrt(zr.x*zr.x + zi.x*zi.x))) / log(2.0);
-    float t = fIter / float(u_maxIter);
-    gl_FragColor = vec4(copper(t), 1.0);
+  if (iter>=u_maxIter) { gl_FragColor=vec4(0,0,0,1); }
+  else {
+    float f=float(iter)+1.0-log(log(sqrt(zr.x*zr.x+zi.x*zi.x)))/log(2.0);
+    gl_FragColor=vec4(copper(f/float(u_maxIter)),1.0);
   }
 }
 `;
 
-// ===================== Compile & link both programs =====================
+// ===================== Compile programs =====================
 function compileShader(src, type) {
   const s = gl.createShader(type);
   gl.shaderSource(s, src);
   gl.compileShader(s);
-  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-    console.error(gl.getShaderInfoLog(s));
-  }
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s));
   return s;
 }
-
 function createProgram(fragSrc) {
   const p = gl.createProgram();
   gl.attachShader(p, compileShader(vertSrc, gl.VERTEX_SHADER));
   gl.attachShader(p, compileShader(fragSrc, gl.FRAGMENT_SHADER));
   gl.bindAttribLocation(p, 0, 'a_pos');
   gl.linkProgram(p);
-  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
-    console.error(gl.getProgramInfoLog(p));
-  }
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
   return p;
 }
 
 const progFast = createProgram(fragSrcFast);
+const progPerturb = createProgram(fragSrcPerturb);
 const progDF64 = createProgram(fragSrcDF64);
 
-// Uniform locations — fast program
 const fast = {
   resolution: gl.getUniformLocation(progFast, 'u_resolution'),
-  center:     gl.getUniformLocation(progFast, 'u_center'),
-  scale:      gl.getUniformLocation(progFast, 'u_scale'),
-  maxIter:    gl.getUniformLocation(progFast, 'u_maxIter'),
-  type:       gl.getUniformLocation(progFast, 'u_type'),
-  juliaC:     gl.getUniformLocation(progFast, 'u_juliaC'),
+  center: gl.getUniformLocation(progFast, 'u_center'),
+  scale: gl.getUniformLocation(progFast, 'u_scale'),
+  maxIter: gl.getUniformLocation(progFast, 'u_maxIter'),
+  type: gl.getUniformLocation(progFast, 'u_type'),
+  juliaC: gl.getUniformLocation(progFast, 'u_juliaC'),
 };
-
-// Uniform locations — df64 program
-const df64 = {
+const perturb = {
+  resolution: gl.getUniformLocation(progPerturb, 'u_resolution'),
+  pixelScale: gl.getUniformLocation(progPerturb, 'u_pixelScale'),
+  maxIter: gl.getUniformLocation(progPerturb, 'u_maxIter'),
+  type: gl.getUniformLocation(progPerturb, 'u_type'),
+  refOrbit: gl.getUniformLocation(progPerturb, 'u_refOrbit'),
+  orbitLen: gl.getUniformLocation(progPerturb, 'u_orbitLen'),
+  refOffset: gl.getUniformLocation(progPerturb, 'u_refOffset'),
+};
+const df64u = {
   resolution: gl.getUniformLocation(progDF64, 'u_resolution'),
-  cx:         gl.getUniformLocation(progDF64, 'u_cx'),
-  cy:         gl.getUniformLocation(progDF64, 'u_cy'),
-  pxScale:    gl.getUniformLocation(progDF64, 'u_pxScale'),
-  maxIter:    gl.getUniformLocation(progDF64, 'u_maxIter'),
-  type:       gl.getUniformLocation(progDF64, 'u_type'),
-  juliaC:     gl.getUniformLocation(progDF64, 'u_juliaC'),
-  ONE:        gl.getUniformLocation(progDF64, 'ONE'),
+  cx: gl.getUniformLocation(progDF64, 'u_cx'),
+  cy: gl.getUniformLocation(progDF64, 'u_cy'),
+  pxScale: gl.getUniformLocation(progDF64, 'u_pxScale'),
+  maxIter: gl.getUniformLocation(progDF64, 'u_maxIter'),
+  type: gl.getUniformLocation(progDF64, 'u_type'),
+  juliaC: gl.getUniformLocation(progDF64, 'u_juliaC'),
+  ONE: gl.getUniformLocation(progDF64, 'ONE'),
 };
 
-// Full-screen quad (shared via attribute location 0)
+// Full-screen quad
 const buf = gl.createBuffer();
 gl.bindBuffer(gl.ARRAY_BUFFER, buf);
 gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
@@ -520,29 +438,82 @@ gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
 const typeMap = { mandelbrot: 0, julia: 1, burningship: 2, tricorn: 3 };
 
-// Split a JS float64 into two float32s: hi + lo ≈ value
+// ===================== Float texture for perturbation =====================
+const hasFloatTex = !!gl.getExtension('OES_texture_float');
+let orbitTex = null;
+if (hasFloatTex) {
+  orbitTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, orbitTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+// Compute reference orbit on CPU in float64, return Float32Array for GPU texture
+function computeReferenceOrbit(cx, cy, maxIter, type, juliaR, juliaI) {
+  let zr, zi, pr, pi;
+  if (type === 1) { zr = cx; zi = cy; pr = juliaR; pi = juliaI; }
+  else { zr = 0; zi = 0; pr = cx; pi = cy; }
+
+  const data = new Float32Array(maxIter * 4);
+  let len = 0;
+  for (let i = 0; i < maxIter; i++) {
+    data[i * 4] = zr;
+    data[i * 4 + 1] = zi;
+    // data[i*4+2] and [i*4+3] stay 0 (Float32Array default)
+    len = i + 1;
+    const zr2 = zr * zr, zi2 = zi * zi;
+    if (zr2 + zi2 > 1e16) break;
+    const nzi = 2 * zr * zi + pi;
+    zr = zr2 - zi2 + pr;
+    zi = nzi;
+  }
+  return { data, length: len };
+}
+
 function splitDouble(value) {
   const hi = Math.fround(value);
-  const lo = value - hi;
-  return [hi, lo];
+  return [hi, value - hi];
+}
+
+// ===================== Deep zoom CSS transform =====================
+// During interaction at deep zoom, CSS-transform the last rendered frame
+// instead of re-rendering. This eliminates flickering (no orbit recomputation)
+// and lag (CSS transforms are GPU-composited, free). On idle, render the
+// actual fractal and clear the transform. This is the standard approach
+// used by Google Maps, Kalles Fraktaler, and all tile-based renderers.
+let lastRenderedView = null;
+let forceRender = false;
+let deepIdleTimer = null;
+
+function clearDeepState() {
+  lastRenderedView = null;
+  glCanvas.style.transform = '';
+  clearTimeout(deepIdleTimer);
+}
+
+function scheduleDeepRender() {
+  clearTimeout(deepIdleTimer);
+  deepIdleTimer = setTimeout(() => {
+    forceRender = true;
+    scheduleRender();
+  }, 150);
 }
 
 // ===================== Adaptive quality =====================
+const DEEP_ZOOM_THRESHOLD = 50000;
+const MAX_ZOOM_FACTOR = 1e10;
 
-const DF64_ZOOM_THRESHOLD = 50000;
-
-function needsDF64() {
+function needsDeepZoom() {
   const d = defaults[fractalSelect.value];
-  return (d.scale / view.scale) > DF64_ZOOM_THRESHOLD;
+  return (d.scale / view.scale) > DEEP_ZOOM_THRESHOLD;
 }
 
-// Scale iterations with zoom depth — no point running 2000 iterations at 1x zoom
 function computeMaxIter() {
   const d = defaults[fractalSelect.value];
-  const zoomFactor = d.scale / view.scale;
-  return Math.max(200, Math.min(2000,
-    Math.floor(200 + 50 * Math.log2(Math.max(1, zoomFactor)))
-  ));
+  const zf = d.scale / view.scale;
+  return Math.max(200, Math.min(1000, Math.floor(200 + 50 * Math.log2(Math.max(1, zf)))));
 }
 
 // ===================== Render =====================
@@ -552,26 +523,63 @@ function renderGL() {
   const juliaR = parseFloat(juliaCR.value);
   const juliaI = parseFloat(juliaCI.value);
   const maxIter = computeMaxIter();
+  const deep = needsDeepZoom();
 
+  // During interaction at deep zoom: CSS-transform the last render
+  if (deep && lastRenderedView && !forceRender) {
+    const s = lastRenderedView.scale / view.scale;
+    if (s > 4 || s < 0.25) {
+      // CSS scale too extreme — force re-render to limit blur
+      forceRender = true;
+    } else {
+      const tx = (lastRenderedView.cx - view.cx) * height / view.scale;
+      const ty = -(lastRenderedView.cy - view.cy) * height / view.scale;
+      glCanvas.style.transform = `translate(${tx}px,${ty}px) scale(${s})`;
+      return;
+    }
+  }
+
+  // Actual shader render
+  forceRender = false;
+  glCanvas.style.transform = '';
   gl.viewport(0, 0, glCanvas.width, glCanvas.height);
 
-  if (needsDF64()) {
-    gl.useProgram(progDF64);
-    gl.uniform2f(df64.resolution, glCanvas.width, glCanvas.height);
+  if (deep && fractalType <= 1 && hasFloatTex) {
+    // --- Perturbation theory: Mandelbrot & Julia at deep zoom ---
+    // Fresh orbit at current center — no offset, no precision issues.
+    // Only runs on idle or first deep frame, never during active interaction.
+    const orbit = computeReferenceOrbit(view.cx, view.cy, maxIter, fractalType, juliaR, juliaI);
+    gl.bindTexture(gl.TEXTURE_2D, orbitTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, orbit.length, 1, 0, gl.RGBA, gl.FLOAT,
+      orbit.data.subarray(0, orbit.length * 4));
 
+    gl.useProgram(progPerturb);
+    gl.uniform2f(perturb.resolution, glCanvas.width, glCanvas.height);
+    gl.uniform1f(perturb.pixelScale, view.scale / glCanvas.height);
+    gl.uniform1i(perturb.maxIter, maxIter);
+    gl.uniform1i(perturb.type, fractalType);
+    gl.uniform1f(perturb.orbitLen, orbit.length);
+    gl.uniform2f(perturb.refOffset, 0, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, orbitTex);
+    gl.uniform1i(perturb.refOrbit, 0);
+  } else if (deep) {
+    // --- df64 fallback: Burning Ship & Tricorn at deep zoom ---
+    gl.useProgram(progDF64);
+    gl.uniform2f(df64u.resolution, glCanvas.width, glCanvas.height);
     const [cx_hi, cx_lo] = splitDouble(view.cx);
     const [cy_hi, cy_lo] = splitDouble(view.cy);
-    const pixelScale = view.scale / glCanvas.height;
-    const [ps_hi, ps_lo] = splitDouble(pixelScale);
-
-    gl.uniform2f(df64.cx, cx_hi, cx_lo);
-    gl.uniform2f(df64.cy, cy_hi, cy_lo);
-    gl.uniform2f(df64.pxScale, ps_hi, ps_lo);
-    gl.uniform1i(df64.maxIter, maxIter);
-    gl.uniform1i(df64.type, fractalType);
-    gl.uniform2f(df64.juliaC, juliaR, juliaI);
-    gl.uniform1f(df64.ONE, 1.0);
+    const [ps_hi, ps_lo] = splitDouble(view.scale / glCanvas.height);
+    gl.uniform2f(df64u.cx, cx_hi, cx_lo);
+    gl.uniform2f(df64u.cy, cy_hi, cy_lo);
+    gl.uniform2f(df64u.pxScale, ps_hi, ps_lo);
+    gl.uniform1i(df64u.maxIter, maxIter);
+    gl.uniform1i(df64u.type, fractalType);
+    gl.uniform2f(df64u.juliaC, juliaR, juliaI);
+    gl.uniform1f(df64u.ONE, 1.0);
   } else {
+    // --- Fast float32: all types at shallow zoom ---
+    lastRenderedView = null;
     gl.useProgram(progFast);
     gl.uniform2f(fast.resolution, glCanvas.width, glCanvas.height);
     gl.uniform2f(fast.center, view.cx, view.cy);
@@ -582,24 +590,19 @@ function renderGL() {
   }
 
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  if (deep) lastRenderedView = { cx: view.cx, cy: view.cy, scale: view.scale };
 }
 
-function render() {
-  renderQueued = false;
-  renderGL();
-}
-
+function render() { renderQueued = false; renderGL(); }
 function scheduleRender() {
-  if (!renderQueued) {
-    renderQueued = true;
-    requestAnimationFrame(render);
-  }
+  if (!renderQueued) { renderQueued = true; requestAnimationFrame(render); }
 }
 
 // ===================== View =====================
 function resetView() {
   const d = defaults[fractalSelect.value];
   view = { cx: d.cx, cy: d.cy, scale: d.scale };
+  clearDeepState();
   scheduleRender();
 }
 
@@ -611,10 +614,10 @@ function resize() {
   glCanvas.style.height = height + 'px';
   glCanvas.width = Math.round(width * dpr);
   glCanvas.height = Math.round(height * dpr);
+  clearDeepState();
   scheduleRender();
 }
 
-// ===================== Coordinate helpers =====================
 function screenToFractal(sx, sy) {
   const aspect = width / height;
   return {
@@ -630,11 +633,14 @@ glCanvas.addEventListener('wheel', (e) => {
   if (e.deltaMode === 1) delta *= 40;
   if (e.deltaMode === 2) delta *= 800;
   const zoom = Math.pow(1.02, delta);
+  const minScale = defaults[fractalSelect.value].scale / MAX_ZOOM_FACTOR;
+  if (view.scale <= minScale && zoom < 1) return;
   const aspect = width / height;
   const pt = screenToFractal(e.clientX, e.clientY);
-  view.scale *= zoom;
+  view.scale = Math.max(view.scale * zoom, minScale);
   view.cx = pt.r - (e.clientX / width - 0.5) * view.scale * aspect;
   view.cy = pt.i - (e.clientY / height - 0.5) * view.scale;
+  scheduleDeepRender();
   scheduleRender();
 }, { passive: false });
 
@@ -644,15 +650,14 @@ glCanvas.addEventListener('mousedown', (e) => {
   viewStart = { cx: view.cx, cy: view.cy };
   glCanvas.style.cursor = 'grabbing';
 });
-
 glCanvas.addEventListener('mousemove', (e) => {
   if (!isDragging) return;
   const aspect = width / height;
   view.cx = viewStart.cx - ((e.clientX - dragStart.x) / width) * view.scale * aspect;
   view.cy = viewStart.cy - ((e.clientY - dragStart.y) / height) * view.scale;
+  scheduleDeepRender();
   scheduleRender();
 });
-
 glCanvas.addEventListener('mouseup', () => { isDragging = false; glCanvas.style.cursor = 'crosshair'; });
 glCanvas.addEventListener('mouseleave', () => { isDragging = false; glCanvas.style.cursor = 'crosshair'; });
 
@@ -682,21 +687,24 @@ glCanvas.addEventListener('touchmove', (e) => {
     const aspect = width / height;
     view.cx = viewStart.cx - ((e.touches[0].clientX - dragStart.x) / width) * view.scale * aspect;
     view.cy = viewStart.cy - ((e.touches[0].clientY - dragStart.y) / height) * view.scale;
+    scheduleDeepRender();
     scheduleRender();
   } else if (e.touches.length === 2) {
     const t0 = e.touches[0], t1 = e.touches[1];
     const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
     const cx = (t0.clientX + t1.clientX) / 2, cy = (t0.clientY + t1.clientY) / 2;
     const aspect = width / height;
-
     const pt = {
       r: viewStart.cx + (lastTouchCenter.x / width - 0.5) * viewStart.scale * aspect,
       i: viewStart.cy + (lastTouchCenter.y / height - 0.5) * viewStart.scale,
     };
-    const newScale = viewStart.scale * (lastTouchDist / dist);
+    const minScale = defaults[fractalSelect.value].scale / MAX_ZOOM_FACTOR;
+    const newScale = Math.max(viewStart.scale * (lastTouchDist / dist), minScale);
+    if (newScale <= minScale && newScale < view.scale) return;
     view.scale = newScale;
-    view.cx = pt.r - (cx / width - 0.5) * newScale * aspect;
-    view.cy = pt.i - (cy / height - 0.5) * newScale;
+    view.cx = pt.r - (cx / width - 0.5) * view.scale * aspect;
+    view.cy = pt.i - (cy / height - 0.5) * view.scale;
+    scheduleDeepRender();
     scheduleRender();
   }
 }, { passive: false });
@@ -715,9 +723,8 @@ fractalSelect.addEventListener('change', () => {
   juliaControls.style.display = fractalSelect.value === 'julia' ? 'flex' : 'none';
   resetView();
 });
-
-juliaCR.addEventListener('input', () => { juliaCRVal.textContent = juliaCR.value; scheduleRender(); });
-juliaCI.addEventListener('input', () => { juliaCIVal.textContent = juliaCI.value; scheduleRender(); });
+juliaCR.addEventListener('input', () => { juliaCRVal.textContent = juliaCR.value; clearDeepState(); scheduleRender(); });
+juliaCI.addEventListener('input', () => { juliaCIVal.textContent = juliaCI.value; clearDeepState(); scheduleRender(); });
 resetBtn.addEventListener('click', resetView);
 window.addEventListener('resize', resize);
 
