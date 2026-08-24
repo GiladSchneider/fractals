@@ -503,7 +503,7 @@ function scheduleDeepRender() {
 
 // ===================== Adaptive quality =====================
 const DEEP_ZOOM_THRESHOLD = 50000;
-const MAX_ZOOM_FACTOR = 1e10;
+const MAX_ZOOM_FACTOR = 1e4;
 
 function needsDeepZoom() {
   const d = defaults[fractalSelect.value];
